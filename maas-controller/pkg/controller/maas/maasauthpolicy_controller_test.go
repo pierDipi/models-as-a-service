@@ -1360,6 +1360,11 @@ func TestMaaSAuthPolicyReconciler_CacheKeyIsolation(t *testing.T) {
 		t.Fatalf("Get gateway AuthPolicy: %v", err)
 	}
 
+	if sarNamespace := nestedStringRequired(t, gwPolicy, "spec", "defaults", "rules", "authorization", "unmetered-sar",
+		"kubernetesSubjectAccessReview", "resourceAttributes", "namespace", "value"); sarNamespace != namespace {
+		t.Fatalf("SAR namespace = %q, want MaaSAuthPolicy namespace %q", sarNamespace, namespace)
+	}
+
 	// Test 1: apiKeyValidation cache key must include API key material (gateway policy)
 	t.Run("apiKeyValidation includes API key", func(t *testing.T) {
 		assertCacheKeyContains(t, gwPolicy,

@@ -85,8 +85,9 @@ func TestRequireGroupMembershipHasWhenGuard(t *testing.T) {
 	if !ok || predicate == "" {
 		t.Fatalf("when guard must have a predicate CEL expression")
 	}
-	if predicate != celModelIdentityAvailable {
-		t.Fatalf("when guard predicate = %q, want celModelIdentityAvailable (%q)", predicate, celModelIdentityAvailable)
+	expected := "(" + celModelIdentityAvailable + ") && !" + celUnmeteredMode
+	if predicate != expected {
+		t.Fatalf("when guard predicate = %q, want %q", predicate, expected)
 	}
 }
 

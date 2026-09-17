@@ -84,8 +84,8 @@ type MaaSAuthPolicyReconciler struct {
 	// Applies to apiKeyValidation and subscription-info metadata evaluators.
 	MetadataCacheTTL int64
 
-	// AuthzCacheTTL is the TTL in seconds for Authorino OPA authorization caching.
-	// Applies to auth-valid, subscription-valid, and require-group-membership authorization evaluators.
+	// AuthzCacheTTL is the TTL in seconds for Authorino authorization caching.
+	// Applies to auth-valid, subscription-valid, require-group-membership, and unmetered-sar.
 	AuthzCacheTTL int64
 
 	// Recorder emits Kubernetes events for conflict detection warnings.
@@ -434,7 +434,7 @@ const (
 		`   : ""))`
 	// Prefer MaaSModelRef identity resolved by subscription select (handles BBR
 	// publisher IDs). Fall back to path/header identity for path-based routing.
-	celResolvedModelIdentity = `(has(auth.metadata["subscription-info"].resolvedModel) && ` +
+	celResolvedModelIdentity = `(("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].resolvedModel)) && ` +
 		`auth.metadata["subscription-info"].resolvedModel != "" ` +
 		`? auth.metadata["subscription-info"].resolvedModel ` +
 		`: ` + celModelIdentity + `)`
@@ -584,7 +584,7 @@ func (r *MaaSAuthPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	gwChanged, reconcileErr := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, tenantID, gatewayNs, gatewayName)
+	gwChanged, reconcileErr := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, tenantID, policy.Namespace, gatewayNs, gatewayName)
 	if reconcileErr != nil {
 		log.Error(reconcileErr, "failed to reconcile gateway AuthPolicy")
 		r.updateStatus(ctx, policy, maasv1alpha1.PhaseFailed, fmt.Sprintf("Failed to reconcile gateway AuthPolicy: %v", reconcileErr), statusSnapshot)
@@ -727,10 +727,27 @@ type authPolicyRef struct {
 	ModelNamespace string
 }
 
+const (
+	unmeteredSARAuthorization = "unmetered-sar"
+	// The header selects an authorization path; it never establishes identity
+	// or grants an exemption. All matching requests must pass the SAR.
+	// Guardrail services are one use case for this unmetered access path.
+	celUnmeteredMode = `("x-maas-invocation-mode" in request.headers && request.headers["x-maas-invocation-mode"] == "unmetered")`
+	// API-key authentication produces a string, so guard object accesses.
+	// Provenance is overwritten by each object-producing authentication method.
+	celUnmeteredIdentity = `(type(auth.identity) == map && has(auth.identity.maas_authentication) && ` +
+		`auth.identity.maas_authentication == "kubernetes" && has(auth.identity.user) && ` +
+		`has(auth.identity.user.username) && auth.identity.user.username.startsWith("system:serviceaccount:"))`
+	// Path routing exposes the model name in the second segment. Body routing
+	// uses the full tenant-visible identifier supplied by the gateway.
+	celUnmeteredModelName = "(" + celPathModelIdentityAvailable + " ? " + celPathParts +
+		`[1] : ("x-gateway-model-name" in request.headers ? request.headers["x-gateway-model-name"] : ""))`
+)
+
 // buildGatewayAuthPolicySpec returns the Authorino AuthPolicy spec for the singleton
 // Gateway-level policy. Model identity is resolved dynamically via CEL on every request
 // rather than being baked in per-model, so this spec is the same for all MaaSAuthPolicy CRs.
-func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(oidc *oidcConfig, xAPIKeyEnabled bool, tenantID, tenantName, gatewayNamespace, gatewayName string) map[string]any {
+func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(oidc *oidcConfig, xAPIKeyEnabled bool, tenantID, subscriptionNamespace, gatewayNamespace, gatewayName string) map[string]any {
 	// Construct tenant-specific maas-api service name using TenantIdentifier
 	// Default tenant (tenantID="") uses "maas-api", others use "maas-api-{tenantID}"
 	maasAPIServiceName := "maas-api"
@@ -775,6 +792,9 @@ func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(oidc *oidcConfig, 
 		// CEL context, accessing request.headers.authorization when the header is
 		// absent throws an error that silently skips the method.
 		"openshift-identities": map[string]any{
+			"overrides": map[string]any{
+				"maas_authentication": map[string]any{"value": "kubernetes"},
+			},
 			"kubernetesTokenReview": map[string]any{
 				"audiences": []any{r.ClusterAudience},
 			},
@@ -809,6 +829,10 @@ func (r *MaaSAuthPolicyReconciler) buildGatewayAuthPolicySpec(oidc *oidcConfig, 
 
 	if oidc != nil {
 		authenticationRules["oidc-identities"] = map[string]any{
+			// Overwrite any issuer-supplied claim that could impersonate TokenReview.
+			"overrides": map[string]any{
+				"maas_authentication": map[string]any{"value": "oidc"},
+			},
 			"jwt": map[string]any{
 				"issuerUrl": oidc.IssuerURL,
 				"ttl":       int64(oidc.TTL),
@@ -886,7 +910,7 @@ allow {
 		"subscription-valid": map[string]any{
 			"when": []any{
 				map[string]any{
-					"predicate": celModelIdentityAvailable,
+					"predicate": "(" + celModelIdentityAvailable + ") && !" + celUnmeteredMode,
 				},
 			},
 			"metrics":  false,
@@ -910,7 +934,9 @@ allow {
 		"require-group-membership": map[string]any{
 			"when": []any{
 				map[string]any{
-					"predicate": celModelIdentityAvailable,
+					// Rules are ANDed: ordinary membership and unmetered SAR are
+					// mutually exclusive. Unmetered access does not require a subscription.
+					"predicate": "(" + celModelIdentityAvailable + ") && !" + celUnmeteredMode,
 				},
 			},
 			"metrics":  false,
@@ -923,6 +949,43 @@ allow {
 					"selector": subscriptionGatewayCacheKeySelector(),
 				},
 				"ttl": r.authzCacheTTL(),
+			},
+		},
+		"unmetered-identity-valid": map[string]any{
+			"when":     []any{map[string]any{"predicate": "(" + celModelIdentityAvailable + ") && " + celUnmeteredMode}},
+			"priority": int64(0), "metrics": false,
+			"patternMatching": map[string]any{"patterns": []any{
+				map[string]any{"predicate": celUnmeteredIdentity},
+			}},
+		},
+		"unmetered-context-valid": map[string]any{
+			"when":     []any{map[string]any{"predicate": "(" + celModelIdentityAvailable + ") && " + celUnmeteredMode}},
+			"priority": int64(0), "metrics": false,
+			"patternMatching": map[string]any{"patterns": []any{
+				map[string]any{"predicate": fmt.Sprintf(`%q != "" && %s != ""`, subscriptionNamespace, celUnmeteredModelName)},
+			}},
+		},
+		unmeteredSARAuthorization: map[string]any{
+			"when":     []any{map[string]any{"predicate": "(" + celModelIdentityAvailable + ") && " + celUnmeteredMode}},
+			"priority": int64(1), "metrics": false,
+			// Cache by the caller, policy namespace, and full routing identity.
+			// RBAC revocations take effect after cached decisions expire.
+			"cache": map[string]any{
+				"key": map[string]any{
+					"selector": fmt.Sprintf(`auth.identity.user.username + "|" + %q + "|" + %s`, subscriptionNamespace, celModelIdentity),
+				},
+				"ttl": r.authzCacheTTL(),
+			},
+			"kubernetesSubjectAccessReview": map[string]any{
+				"user": map[string]any{"expression": "auth.identity.user.username"},
+				"resourceAttributes": map[string]any{
+					// MaaSAuthPolicy namespace, also known as tenant target namespace.
+					"namespace": map[string]any{"value": subscriptionNamespace},
+					"group":     map[string]any{"value": "maas.opendatahub.io"},
+					"resource":  map[string]any{"value": "models"},
+					"verb":      map[string]any{"value": "invoke-unmetered"},
+					"name":      map[string]any{"expression": celUnmeteredModelName},
+				},
 			},
 		},
 	}
@@ -1007,7 +1070,7 @@ allow {
 			"subscription-info": map[string]any{
 				"when": []any{
 					map[string]any{
-						"predicate": celModelIdentityAvailable,
+						"predicate": "(" + celModelIdentityAvailable + ") && !" + celUnmeteredMode,
 					},
 				},
 				"http": map[string]any{
@@ -1120,7 +1183,7 @@ allow {
 									"expression": `(has(auth.metadata) && has(auth.metadata.apiKeyValidation)) ? auth.metadata.apiKeyValidation.keyName : ""`,
 								},
 								"selected_subscription": map[string]any{
-									"expression": `has(auth.metadata["subscription-info"].name) ? auth.metadata["subscription-info"].name : ""`,
+									"expression": `("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].name)) ? auth.metadata["subscription-info"].name : ""`,
 								},
 								// Model-scoped subscription key: namespace/name@modelIdentity
 								// Prefer resolvedModel from subscription-info (MaaSModelRef
@@ -1128,21 +1191,29 @@ allow {
 								// predicates match for both path and body-based routing.
 								"selected_subscription_key": map[string]any{
 									"expression": fmt.Sprintf(
-										`(has(auth.metadata["subscription-info"].namespace) && `+
-											`has(auth.metadata["subscription-info"].name)) `+
+										`(("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].namespace)) && `+
+											`("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].name))) `+
 											`? auth.metadata["subscription-info"].namespace + "/" `+
 											`+ auth.metadata["subscription-info"].name + "@" + %s : ""`,
 										celResolvedModelIdentity,
 									),
 								},
+								// Only a successful SAR can exempt the resolved model.
+								"unmetered": map[string]any{
+									"expression": fmt.Sprintf(
+										`(%s && %s && %s && has(auth.authorization) && "unmetered-sar" in auth.authorization && `+
+											`auth.authorization["unmetered-sar"] == true)`,
+										celModelIdentityAvailable, celUnmeteredMode, celUnmeteredIdentity,
+									),
+								},
 								"subscription_info": map[string]any{
-									"expression": `has(auth.metadata["subscription-info"].name) ? auth.metadata["subscription-info"] : {}`,
+									"expression": `("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].name)) ? auth.metadata["subscription-info"] : {}`,
 								},
 								"subscription_error": map[string]any{
-									"expression": `has(auth.metadata["subscription-info"].error) ? auth.metadata["subscription-info"].error : ""`,
+									"expression": `("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].error)) ? auth.metadata["subscription-info"].error : ""`,
 								},
 								"subscription_error_message": map[string]any{
-									"expression": `has(auth.metadata["subscription-info"].message) ? auth.metadata["subscription-info"].message : ""`,
+									"expression": `("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].message)) ? auth.metadata["subscription-info"].message : ""`,
 								},
 							},
 						},
@@ -1159,11 +1230,11 @@ allow {
 			"unauthorized": map[string]any{
 				"code": int64(403),
 				"body": map[string]any{
-					"expression": `has(auth.metadata["subscription-info"].message) ? auth.metadata["subscription-info"].message : "Access denied"`,
+					"expression": `("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].message)) ? auth.metadata["subscription-info"].message : "Access denied"`,
 				},
 				"headers": map[string]any{
 					"x-ext-auth-reason": map[string]any{
-						"expression": `has(auth.metadata["subscription-info"].error) ? auth.metadata["subscription-info"].error : "unauthorized"`,
+						"expression": `("subscription-info" in auth.metadata && has(auth.metadata["subscription-info"].error)) ? auth.metadata["subscription-info"].error : "unauthorized"`,
 					},
 					"content-type": map[string]any{
 						"value": "text/plain",
@@ -1342,18 +1413,11 @@ func isEmptyCollection(v any) bool {
 // the gateway namespace. All MaaSAuthPolicy reconciliations converge on this one resource.
 func (r *MaaSAuthPolicyReconciler) reconcileGatewayAuthPolicy(
 	ctx context.Context, log logr.Logger,
-	oidc *oidcConfig, xAPIKeyEnabled bool, tenantID, gatewayNamespace, gatewayName string,
+	oidc *oidcConfig, xAPIKeyEnabled bool, tenantID, subscriptionNamespace, gatewayNamespace, gatewayName string,
 ) (bool, error) {
 	log.Info("reconcileGatewayAuthPolicy entered", "gatewayNamespace", gatewayNamespace, "gatewayName", gatewayName, "tenantID", tenantID, "xAPIKeyEnabled", xAPIKeyEnabled)
 
-	// Calculate tenantName from tenantID
-	// Default tenant (tenantID="") uses "models-as-a-service", others use tenantID
-	tenantName := "models-as-a-service"
-	if tenantID != "" {
-		tenantName = tenantID
-	}
-
-	spec := r.buildGatewayAuthPolicySpec(oidc, xAPIKeyEnabled, tenantID, tenantName, gatewayNamespace, gatewayName)
+	spec := r.buildGatewayAuthPolicySpec(oidc, xAPIKeyEnabled, tenantID, subscriptionNamespace, gatewayNamespace, gatewayName)
 	authPolicyName := r.gatewayAuthPolicyName(gatewayNamespace, gatewayName)
 	isTenantGateway := gatewayNamespace != r.GatewayNamespace || gatewayName != r.GatewayName
 
@@ -1668,7 +1732,7 @@ func (r *MaaSAuthPolicyReconciler) handleDeletion(ctx context.Context, log logr.
 			} else {
 				oidc := r.fetchOIDCConfig(ctx, log, policy.Namespace)
 				xAPIKeyEnabled := r.discoverXAPIKeyNeeded(ctx, log)
-				if _, err := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, tenantID, gatewayNs, gatewayName); err != nil {
+				if _, err := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, tenantID, policy.Namespace, gatewayNs, gatewayName); err != nil {
 					log.Error(err, "failed to reset gateway auth to base version")
 					return ctrl.Result{}, err
 				}
@@ -1690,7 +1754,7 @@ func (r *MaaSAuthPolicyReconciler) handleDeletion(ctx context.Context, log logr.
 // over from pre-#912 clusters. Existing policies are left unchanged.
 func (r *MaaSAuthPolicyReconciler) ensureBaseGatewayAuthPolicy(
 	ctx context.Context, log logr.Logger,
-	oidc *oidcConfig, xAPIKeyEnabled bool, tenantID, gatewayNamespace, gatewayName string,
+	oidc *oidcConfig, xAPIKeyEnabled bool, tenantID, subscriptionNamespace, gatewayNamespace, gatewayName string,
 ) error {
 	authPolicyName := r.gatewayAuthPolicyName(gatewayNamespace, gatewayName)
 	if gatewayNamespace == r.GatewayNamespace && gatewayName == r.GatewayName {
@@ -1705,7 +1769,7 @@ func (r *MaaSAuthPolicyReconciler) ensureBaseGatewayAuthPolicy(
 		return fmt.Errorf("failed to check gateway AuthPolicy %s/%s: %w", gatewayNamespace, authPolicyName, err)
 	}
 
-	_, err := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, tenantID, gatewayNamespace, gatewayName)
+	_, err := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, tenantID, subscriptionNamespace, gatewayNamespace, gatewayName)
 	return err
 }
 
@@ -2214,7 +2278,7 @@ func (r *MaaSAuthPolicyReconciler) syncDefaultGatewayAuthPolicyForXAPIKeyDiscove
 	}
 	oidc := r.fetchOIDCConfig(ctx, log, oidcNS)
 	xAPIKeyEnabled := r.discoverXAPIKeyNeeded(ctx, log)
-	_, err := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, "", r.GatewayNamespace, r.GatewayName)
+	_, err := r.reconcileGatewayAuthPolicy(ctx, log, oidc, xAPIKeyEnabled, "", r.TenantNamespace, r.GatewayNamespace, r.GatewayName)
 	return err
 }
 

@@ -618,7 +618,7 @@ func (r *MaaSSubscriptionReconciler) reconcileTRLPForModel(ctx context.Context, 
 					// Exempt /v1/models endpoint from token rate limiting.
 					// This endpoint is used for model discovery/metadata and does not consume inference tokens.
 					// Users should be able to query model capabilities even when their token quota is exhausted.
-					"predicate": fmt.Sprintf(`auth.identity.selected_subscription_key == "%s" && !request.path.endsWith("/v1/models")`, modelScopedRef),
+					"predicate": subscriptionTokenLimitPredicate(modelScopedRef),
 				},
 			},
 			"counters": []any{
@@ -1342,4 +1342,11 @@ func (r *MaaSSubscriptionReconciler) mapHTTPRouteToMaaSSubscriptions(ctx context
 		}
 	}
 	return requests
+}
+
+// subscriptionTokenLimitPredicate excludes requests authorized for unmetered access.
+// The boolean comes from the successful SAR for this request, never client headers.
+func subscriptionTokenLimitPredicate(modelScopedRef string) string {
+	return fmt.Sprintf(`!(has(auth.identity.unmetered) && auth.identity.unmetered == true) && `+
+		`auth.identity.selected_subscription_key == %q && !request.path.endsWith("/v1/models")`, modelScopedRef)
 }
