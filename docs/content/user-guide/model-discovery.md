@@ -87,6 +87,7 @@ Each model in the `data` array contains:
 | `ready` | Whether the model is currently available (`true`/`false`) |
 | `modelDetails.displayName` | Human-friendly model name |
 | `modelDetails.description` | Model description |
+| `modelDetails.metadata` | Optional allowlisted MaaSModelRef annotations for ExternalModel refs; see [configuration and examples](../reference/crds/maas-model-ref.md#allowlisted-metadata-for-externalmodel-refs) |
 | `subscriptions` | List of subscriptions that provide access to this model |
 
 ---

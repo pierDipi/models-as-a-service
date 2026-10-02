@@ -276,7 +276,7 @@ func registerHandlers(
 	}
 
 	tokenHandler := token.NewHandler(log, cfg.TenantName)
-	modelsHandler := handlers.NewModelsHandler(log, modelManager, subscriptionSelector, cluster.MaaSModelRefLister, metricsRecorder)
+	modelsHandler := handlers.NewModelsHandler(log, modelManager, subscriptionSelector, cluster.MaaSModelRefLister, metricsRecorder, cfg.ModelAnnotationAllowlist...)
 	subscriptionHandler := subscription.NewHandler(log, subscriptionSelector, metricsRecorder)
 
 	apiKeyService := api_keys.NewServiceWithLogger(store, cfg, subscriptionSelector, log)

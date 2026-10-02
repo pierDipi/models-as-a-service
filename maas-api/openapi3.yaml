@@ -824,6 +824,14 @@ components:
                     type: object
                     description: Additional model metadata from MaaSModelRef annotations
                     properties:
+                        metadata:
+                            type: object
+                            additionalProperties:
+                                type: string
+                            description: >-
+                                Allowlisted annotations from the MaaSModelRef, included only for
+                                ExternalModel refs. Keys are configured through MODEL_ANNOTATION_ALLOWLIST.
+                                Values remain strings. Omitted when no configured keys are present.
                         displayName:
                             type: string
                             description: Human-readable display name (from openshift.io/display-name annotation)

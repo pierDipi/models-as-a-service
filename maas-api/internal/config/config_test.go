@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,6 +25,25 @@ func TestLoad_EnvironmentVariables(t *testing.T) {
 		envVars map[string]string
 		check   func(t *testing.T, cfg *Config)
 	}{
+		{
+			name:    "MODEL_ANNOTATION_ALLOWLIST parses trimmed exact keys",
+			envVars: map[string]string{"MODEL_ANNOTATION_ALLOWLIST": " example.com/regions, ,example.com/runtime ,"},
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if !slices.Equal(cfg.ModelAnnotationAllowlist, []string{"example.com/regions", "example.com/runtime"}) {
+					t.Errorf("unexpected annotation allowlist: %v", cfg.ModelAnnotationAllowlist)
+				}
+			},
+		},
+		{
+			name: "annotation allowlist is empty by default",
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if len(cfg.ModelAnnotationAllowlist) != 0 {
+					t.Errorf("expected no allowlisted annotations, got %v", cfg.ModelAnnotationAllowlist)
+				}
+			},
+		},
 		{
 			name:    "GATEWAY_NAME overrides GatewayName and Name defaults to it",
 			envVars: map[string]string{"GATEWAY_NAME": testGatewayName},
@@ -94,6 +114,7 @@ func TestLoad_EnvironmentVariables(t *testing.T) {
 		"DEBUG_MODE", "LOG_FORMAT", "GATEWAY_NAME", "SECURE", "INSTANCE_NAME",
 		"NAMESPACE", "GATEWAY_NAMESPACE", "ADDRESS",
 		"PORT",
+		"MODEL_ANNOTATION_ALLOWLIST",
 		"TLS_CERT", "TLS_KEY", "TLS_SELF_SIGNED",
 		"METRICS_PORT", "METRICS_SECURE", "METRICS_CERT_DIR",
 	}
@@ -130,6 +151,16 @@ func TestValidate(t *testing.T) {
 		cfg         Config
 		expectError string
 	}{
+		{
+			name:        "wildcard annotation allowlist is rejected",
+			cfg:         Config{ModelAnnotationAllowlist: []string{"example.com/*"}},
+			expectError: "MODEL_ANNOTATION_ALLOWLIST",
+		},
+		{
+			name:        "invalid annotation key is rejected",
+			cfg:         Config{ModelAnnotationAllowlist: []string{"not a key"}},
+			expectError: "MODEL_ANNOTATION_ALLOWLIST",
+		},
 		{
 			name: "missing DBConnectionURL returns error",
 			cfg: Config{
@@ -169,6 +200,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "valid insecure config sets default address :8080",
 			cfg: Config{
+				ModelAnnotationAllowlist:  []string{"example.com/regions", "runtime"},
 				DBConnectionURL:           "postgresql://localhost/test",
 				Secure:                    false,
 				APIKeyMaxExpirationDays:   30,

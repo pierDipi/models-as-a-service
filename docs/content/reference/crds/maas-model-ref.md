@@ -215,7 +215,51 @@ When annotations are set, the `GET /v1/models` response includes a `modelDetails
 }
 ```
 
-When no annotations are set (or all values are empty), `modelDetails` is omitted from the response.
+When no display metadata or allowlisted metadata is present, `modelDetails` is omitted from the response.
+
+### Allowlisted metadata for ExternalModel refs
+
+For MaaSModelRefs with `spec.modelRef.kind: ExternalModel`, the MaaS API can also
+expose selected annotations in an optional `modelDetails.metadata` object on each
+`GET /v1/models` entry. Configure the maas-api environment variable
+`MODEL_ANNOTATION_ALLOWLIST` with a comma-separated list of exact annotation keys.
+It defaults to empty. Whitespace around keys and empty list entries are ignored;
+wildcards and invalid annotation keys are rejected at startup.
+
+For example, using illustrative keys:
+
+```bash
+MODEL_ANNOTATION_ALLOWLIST=example.com/regions,example.com/routing-provider
+```
+
+Add those annotations to the **MaaSModelRef** referencing the ExternalModel:
+
+```yaml
+metadata:
+  annotations:
+    example.com/regions: '["eu-west","us-east"]'
+    example.com/routing-provider: "praxis-ai-grid"
+```
+
+The model entry then includes:
+
+```json
+{
+  "modelDetails": {
+    "metadata": {
+      "example.com/regions": "[\"eu-west\",\"us-east\"]",
+      "example.com/routing-provider": "praxis-ai-grid"
+    }
+  }
+}
+```
+
+Only configured keys that exist on the MaaSModelRef are returned. Values remain
+strings, including empty strings and JSON-encoded values. `modelDetails.metadata` is omitted
+when no keys match and for all LLMInferenceService refs. It describes declared
+metadata; it does not report live regional availability or change routing.
+`modelDetails` is included even when the allowlisted annotations are its only
+content. Display fields and subscription filtering continue to apply.
 
 ---
 

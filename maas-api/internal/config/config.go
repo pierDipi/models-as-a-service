@@ -92,6 +92,10 @@ type Config struct {
 	// by model discovery probes. Default: false (HTTP/1.1 only).
 	DiscoveryEnableHTTP2 bool
 
+	// ModelAnnotationAllowlist lists exact MaaSModelRef annotation keys exposed in
+	// GET /v1/models for ExternalModel refs only. Empty by default.
+	ModelAnnotationAllowlist []string
+
 	// OTELEndpoint is the OTLP gRPC endpoint for trace export (e.g., "localhost:4317").
 	// Tracing is disabled when empty.
 	OTELEndpoint string
@@ -136,6 +140,12 @@ func Load() *Config {
 
 	aitenantName := env.GetString("AITENANT_NAME", tenantName)
 	aitenantNamespace := env.GetString("AITENANT_NAMESPACE", "ai-tenants")
+	var modelAnnotationAllowlist []string
+	for key := range strings.SplitSeq(env.GetString("MODEL_ANNOTATION_ALLOWLIST", ""), ",") {
+		if key = strings.TrimSpace(key); key != "" {
+			modelAnnotationAllowlist = append(modelAnnotationAllowlist, key)
+		}
+	}
 
 	c := &Config{
 		Name:                      env.GetString("INSTANCE_NAME", gatewayName),
@@ -160,6 +170,7 @@ func Load() *Config {
 		MetricsSecure:             metricsSecure,
 		MetricsCertDir:            metricsCertDir,
 		DiscoveryEnableHTTP2:      discoveryEnableHTTP2,
+		ModelAnnotationAllowlist:  modelAnnotationAllowlist,
 		OTELEndpoint:              env.GetString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 		OTELInsecure:              otelInsecure,
 		OTELSampleRate:            otelSampleRate,
@@ -216,6 +227,11 @@ func (c *Config) Validate() error {
 		return err
 	}
 	c.LogFormat = logFormat
+	for _, key := range c.ModelAnnotationAllowlist {
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return fmt.Errorf("MODEL_ANNOTATION_ALLOWLIST key %q is invalid: %v", key, errs)
+		}
+	}
 
 	// Validate required fields
 	if c.DBConnectionURL == "" {

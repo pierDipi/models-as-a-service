@@ -31,7 +31,8 @@ type MaaSModelRefLister interface {
 }
 
 // ListFromMaaSModelRefLister converts cached MaaSModelRef items to API models. Uses status.endpoint and status.phase.
-func ListFromMaaSModelRefLister(lister MaaSModelRefLister) ([]Model, error) {
+// For ExternalModel refs, modelDetails.metadata includes only annotation keys in annotationAllowlist.
+func ListFromMaaSModelRefLister(lister MaaSModelRefLister, annotationAllowlist ...string) ([]Model, error) {
 	if lister == nil {
 		return nil, nil
 	}
@@ -41,7 +42,7 @@ func ListFromMaaSModelRefLister(lister MaaSModelRefLister) ([]Model, error) {
 	}
 	out := make([]Model, 0, len(items))
 	for _, u := range items {
-		m := maasModelRefToModel(u)
+		m := maasModelRefToModel(u, annotationAllowlist...)
 		if m != nil {
 			out = append(out, *m)
 		}
@@ -61,7 +62,7 @@ func GVR() schema.GroupVersionResource {
 // For ExternalModel refs, the ExternalModel CR name is used as the ID.
 // Both kinds advertise the shared gateway base URL from status.httpRouteHostnames[0]
 // when present (falling back to status.endpoint).
-func maasModelRefToModel(u *unstructured.Unstructured) *Model {
+func maasModelRefToModel(u *unstructured.Unstructured, annotationAllowlist ...string) *Model {
 	if u == nil {
 		return nil
 	}
@@ -97,6 +98,17 @@ func maasModelRefToModel(u *unstructured.Unstructured) *Model {
 	}
 
 	annotations := u.GetAnnotations()
+	var metadata map[string]string
+	if kind == kindExternalModel {
+		for _, key := range annotationAllowlist {
+			if value, exists := annotations[key]; exists {
+				if metadata == nil {
+					metadata = make(map[string]string)
+				}
+				metadata[key] = value
+			}
+		}
+	}
 	var details *Details
 	if annotations != nil {
 		d := Details{
@@ -104,6 +116,7 @@ func maasModelRefToModel(u *unstructured.Unstructured) *Model {
 			Description:   annotations[constant.AnnotationDescription],
 			GenAIUseCase:  annotations[constant.AnnotationGenAIUseCase],
 			ContextWindow: annotations[constant.AnnotationContextWindow],
+			Metadata:      metadata,
 		}
 		if raw := annotations[constant.AnnotationModelCapabilities]; raw != "" {
 			var caps []string
@@ -111,7 +124,8 @@ func maasModelRefToModel(u *unstructured.Unstructured) *Model {
 				d.ModelCapabilities = caps
 			}
 		}
-		if d.DisplayName != "" || d.Description != "" || d.GenAIUseCase != "" || d.ContextWindow != "" || len(d.ModelCapabilities) > 0 {
+		if d.DisplayName != "" || d.Description != "" || d.GenAIUseCase != "" || d.ContextWindow != "" ||
+			len(d.ModelCapabilities) > 0 || len(d.Metadata) > 0 {
 			details = &d
 		}
 	}

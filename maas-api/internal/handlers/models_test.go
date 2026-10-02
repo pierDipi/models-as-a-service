@@ -1352,6 +1352,56 @@ func maasModelRefExternalModelUnstructured(name, namespace, modelRefName string,
 	return u
 }
 
+func TestListModels_ExternalModelMetadata(t *testing.T) {
+	const regionsKey = "example.com/regions"
+	log := logger.Development()
+	lister := fakeMaaSModelRefLister{
+		fixtures.TestNamespace: []*unstructured.Unstructured{
+			maasModelRefExternalModelUnstructured("visible-ref", fixtures.TestNamespace, "visible-model", true, map[string]string{
+				regionsKey:            `["eu-west","us-east"]`,
+				"example.com/private": "internal-only",
+			}),
+			maasModelRefExternalModelUnstructured("hidden-ref", fixtures.TestNamespace, "hidden-model", true, map[string]string{
+				regionsKey: "hidden-region",
+			}),
+		},
+	}
+	manager, err := models.NewManager(log, 15, "", false, 0, nil)
+	require.NoError(t, err)
+	selector := subscription.NewSelector(log, &fakeSubscriptionLister{modelRefs: []any{
+		map[string]any{"name": "visible-ref", "namespace": fixtures.TestNamespace},
+	}}, lister, nil)
+	handler := handlers.NewModelsHandler(log, manager, selector, lister, nil, regionsKey)
+
+	router := gin.New()
+	router.GET("/v1/models", func(c *gin.Context) {
+		c.Set("user", &token.UserContext{Username: "test-user", Groups: []string{"free-users"}})
+		handler.ListLLMs(c)
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer user-token")
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var response pagination.Page[models.Model]
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Data, 1, "metadata must not bypass subscription filtering")
+	assert.Equal(t, "visible-model", response.Data[0].ID)
+	require.NotNil(t, response.Data[0].Details)
+	assert.Equal(t, map[string]string{regionsKey: `["eu-west","us-east"]`}, response.Data[0].Details.Metadata)
+	var fields map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &fields))
+	entries, ok := fields["data"].([]any)
+	require.True(t, ok)
+	entry, ok := entries[0].(map[string]any)
+	require.True(t, ok)
+	assert.NotContains(t, entry, "metadata")
+	assert.NotContains(t, w.Body.String(), "hidden-region")
+	assert.NotContains(t, w.Body.String(), "internal-only")
+	assert.NotContains(t, w.Body.String(), `"annotations"`)
+}
+
 func TestListModels_ExternalModelUsesModelRefName(t *testing.T) {
 	testLogger := logger.Development()
 

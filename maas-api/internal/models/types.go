@@ -10,13 +10,15 @@ import (
 	"knative.dev/pkg/apis"
 )
 
-// Details contains additional metadata from LLMInferenceService annotations.
+// Details contains additional metadata from MaaSModelRef annotations.
 type Details struct {
 	GenAIUseCase      string   `json:"genaiUseCase,omitempty"`
 	Description       string   `json:"description,omitempty"`
 	DisplayName       string   `json:"displayName,omitempty"`
 	ContextWindow     string   `json:"contextWindow,omitempty"`
 	ModelCapabilities []string `json:"modelCapabilities,omitempty"`
+	// Metadata contains allowlisted MaaSModelRef annotations for ExternalModel refs only.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // SubscriptionInfo contains metadata about which subscription provides access to a model.

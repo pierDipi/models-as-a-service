@@ -290,6 +290,7 @@ The maas-api server is configured via **environment variables** or **CLI flags**
 | `PORT` | - | **DEPRECATED.** Use `ADDRESS` with `SECURE=false` instead. |
 | `API_KEY_MAX_EXPIRATION_DAYS` | `90` | Maximum allowed API key lifetime in days. Users cannot create keys with longer expiration. Minimum: 1. |
 | `ACCESS_CHECK_TIMEOUT_SECONDS` | `15` | Timeout for model access validation during `/v1/models` requests. Models that don't respond within this window are excluded. Minimum: 1. |
+| `MODEL_ANNOTATION_ALLOWLIST` | Empty | See [allowlisted metadata for ExternalModel refs](../docs/content/reference/crds/maas-model-ref.md#allowlisted-metadata-for-externalmodel-refs). |
 | `TLS_CERT` | - | Path to TLS certificate file (PEM format). Required if `SECURE=true` and not using self-signed cert. |
 | `TLS_KEY` | - | Path to TLS private key file (PEM format). Required if `SECURE=true` and not using self-signed cert. |
 | `TLS_SELF_SIGNED` | `false` | Generate self-signed certificate. Alternative to providing `TLS_CERT`/`TLS_KEY`. |

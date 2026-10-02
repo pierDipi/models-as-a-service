@@ -40,16 +40,19 @@ type ModelsHandler struct {
 	logger               *logger.Logger
 	maasModelRefLister   models.MaaSModelRefLister
 	metrics              MetricsRecorder
+	annotationAllowlist  []string
 }
 
 // NewModelsHandler creates a new models handler.
 // GET /v1/models lists models from the MaaSModelRef lister when set; otherwise the list is empty.
+// annotationAllowlist controls which MaaSModelRef annotations appear in modelDetails.metadata for ExternalModel refs.
 func NewModelsHandler(
 	log *logger.Logger,
 	modelMgr *models.Manager,
 	subscriptionSelector *subscription.Selector,
 	maasModelRefLister models.MaaSModelRefLister,
 	metrics MetricsRecorder,
+	annotationAllowlist ...string,
 ) *ModelsHandler {
 	if log == nil {
 		log = logger.Production()
@@ -60,6 +63,7 @@ func NewModelsHandler(
 		logger:               log,
 		maasModelRefLister:   maasModelRefLister,
 		metrics:              metrics,
+		annotationAllowlist:  append([]string(nil), annotationAllowlist...),
 	}
 }
 
@@ -429,7 +433,7 @@ func (h *ModelsHandler) ListLLMs(c *gin.Context) {
 	accessCheckedAt := time.Now().UTC()
 	if h.maasModelRefLister != nil {
 		h.logger.Debug("Listing models from MaaSModelRef cache (all namespaces)")
-		list, err := models.ListFromMaaSModelRefLister(h.maasModelRefLister)
+		list, err := models.ListFromMaaSModelRefLister(h.maasModelRefLister, h.annotationAllowlist...)
 		if err != nil {
 			h.logger.Error("Listing from MaaSModelRef failed", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
