@@ -285,7 +285,14 @@ func registerHandlers(
 
 	apiKeyService := api_keys.NewServiceWithLogger(store, cfg, subscriptionSelector, log)
 	apiKeyService.StartDebounceCleanup(ctx)
-	apiKeyHandler := api_keys.NewHandler(log, apiKeyService, cluster.AdminChecker, metricsRecorder)
+	apiKeyHandler := api_keys.NewHandler(
+		log,
+		apiKeyService,
+		cluster.AdminChecker,
+		metricsRecorder,
+		subscriptionSelector,
+		api_keys.WithDelegatedAPIKeyAdmin(cfg.DelegatedAPIKeyAdminEnabled),
+	)
 
 	tenantLogCfg := middleware.TenantLoggerConfig{
 		DefaultTenant:   cfg.TenantName,

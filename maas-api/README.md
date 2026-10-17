@@ -290,6 +290,7 @@ The maas-api server is configured via **environment variables** or **CLI flags**
 | `PORT` | - | **DEPRECATED.** Use `ADDRESS` with `SECURE=false` instead. |
 | `API_KEY_MAX_EXPIRATION_DAYS` | `90` | Maximum allowed API key lifetime in days. Users cannot create keys with longer expiration. Minimum: 1. |
 | `API_KEY_DELETION_RETENTION_DAYS` | `90` | Retention period in days for lifecycle-invalidated API keys before physical deletion. Minimum: 1. |
+| `DELEGATED_API_KEY_ADMIN_ENABLED` | `false` | Enable organization subscription administrators to search, inspect, and revoke API keys. Enable only after the identity-asserting ingress hop is restricted to approved callers. |
 | `ACCESS_CHECK_TIMEOUT_SECONDS` | `15` | Timeout for model access validation during `/v1/models` requests. Models that don't respond within this window are excluded. Minimum: 1. |
 | `TLS_CERT` | - | Path to TLS certificate file (PEM format). Required if `SECURE=true` and not using self-signed cert. |
 | `TLS_KEY` | - | Path to TLS private key file (PEM format). Required if `SECURE=true` and not using self-signed cert. |

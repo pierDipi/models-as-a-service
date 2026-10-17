@@ -87,6 +87,26 @@ func TestLoad_EnvironmentVariables(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:    "delegated API key administration defaults to disabled",
+			envVars: map[string]string{},
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if cfg.DelegatedAPIKeyAdminEnabled {
+					t.Error("expected DelegatedAPIKeyAdminEnabled default false")
+				}
+			},
+		},
+		{
+			name:    "DELEGATED_API_KEY_ADMIN_ENABLED=true enables delegated administration",
+			envVars: map[string]string{"DELEGATED_API_KEY_ADMIN_ENABLED": "true"},
+			check: func(t *testing.T, cfg *Config) {
+				t.Helper()
+				if !cfg.DelegatedAPIKeyAdminEnabled {
+					t.Error("expected DelegatedAPIKeyAdminEnabled true")
+				}
+			},
+		},
 	}
 
 	// All env vars that Load() reads, to be cleared before each subtest.
@@ -97,6 +117,7 @@ func TestLoad_EnvironmentVariables(t *testing.T) {
 		"TLS_CERT", "TLS_KEY", "TLS_SELF_SIGNED",
 		"METRICS_PORT", "METRICS_SECURE", "METRICS_CERT_DIR",
 		"API_KEY_DELETION_RETENTION_DAYS",
+		"DELEGATED_API_KEY_ADMIN_ENABLED",
 	}
 
 	for _, tt := range tests {

@@ -82,6 +82,11 @@ type Config struct {
 	// Set to 0 to disable debouncing (every validation writes to DB). Default: 60.
 	LastUsedDebounceSecs int
 
+	// DelegatedAPIKeyAdminEnabled permits organization subscription
+	// administrators to search, inspect, and revoke API keys. It remains false
+	// until the trusted identity asserting hop is restricted to approved callers.
+	DelegatedAPIKeyAdminEnabled bool
+
 	// APIKeyDeletionRetentionDays controls how long lifecycle-invalidated API keys
 	// remain soft-deleted for audit purposes before physical deletion.
 	APIKeyDeletionRetentionDays int
@@ -118,6 +123,7 @@ type Config struct {
 // Load loads configuration from environment variables.
 func Load() *Config {
 	debugMode, _ := env.GetBool("DEBUG_MODE", false)
+	delegatedAPIKeyAdminEnabled, _ := env.GetBool("DELEGATED_API_KEY_ADMIN_ENABLED", false)
 	gatewayName := env.GetString("GATEWAY_NAME", constant.DefaultGatewayName)
 	secure, _ := env.GetBool("SECURE", false)
 	maxExpirationDays, _ := env.GetInt("API_KEY_MAX_EXPIRATION_DAYS", constant.DefaultAPIKeyMaxExpirationDays)
@@ -165,6 +171,7 @@ func Load() *Config {
 		AccessCheckTimeoutSeconds:   accessCheckTimeoutSeconds,
 		SARCacheMaxSize:             sarCacheMaxSize,
 		LastUsedDebounceSecs:        lastUsedDebounceSecs,
+		DelegatedAPIKeyAdminEnabled: delegatedAPIKeyAdminEnabled,
 		APIKeyDeletionRetentionDays: apiKeyDeletionRetentionDays,
 		MetricsPort:                 metricsPort,
 		MetricsSecure:               metricsSecure,
