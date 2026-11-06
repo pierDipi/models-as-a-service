@@ -2654,21 +2654,10 @@ func TestEnsureTenantAPIKeysRevoked_UsesAPIReaderForJobLookup(t *testing.T) {
 	}
 	apiReader := fake.NewClientBuilder().
 		WithScheme(s).
+		WithStatusSubresource(&maasv1alpha1.AITenant{}).
 		WithObjects(aitenant.DeepCopy(), job).
 		Build()
-	cl := fake.NewClientBuilder().
-		WithScheme(s).
-		WithStatusSubresource(&maasv1alpha1.AITenant{}).
-		WithObjects(aitenant).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if _, ok := obj.(*batcv1.Job); ok {
-					return apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, key.Name)
-				}
-				return c.Get(ctx, key, obj, opts...)
-			},
-		}).
-		Build()
+	cl := clientRejectingJobGets{Client: apiReader}
 	r := &AITenantReconciler{
 		Client:       cl,
 		Scheme:       s,

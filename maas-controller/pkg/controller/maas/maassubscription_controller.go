@@ -1189,7 +1189,20 @@ func (r *MaaSSubscriptionReconciler) handleDeletion(ctx context.Context, log log
 }
 
 func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription) (bool, error) {
-	if subscription.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
+	revocationStarted := subscriptionAPIKeyRevocationStarted(subscription)
+	if revocationStarted {
+		complete, waiting, err := r.subscriptionAPIKeyRevocationJobProgress(ctx, subscription)
+		if err != nil {
+			return false, err
+		}
+		if complete {
+			return true, nil
+		}
+		if waiting {
+			return false, nil
+		}
+	}
+	if !revocationStarted && subscription.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
 		retentionAllowed, complete, err := r.ensureSubscriptionAPIKeyRevocationJobStoppedBeforeRetention(ctx, subscription)
 		if err != nil {
 			return false, err
@@ -1214,9 +1227,16 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 		return false, errors.New("application namespace is required for MaaSSubscription API-key cleanup")
 	}
 
-	tenant, err := fetchTenantForNamespace(ctx, r.Client, subscription.Namespace)
+	tenantReader := r.APIReader
+	if tenantReader == nil {
+		tenantReader = r.Client
+	}
+	tenant, err := fetchTenantForNamespace(ctx, tenantReader, subscription.Namespace)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			if revocationStarted {
+				return false, errors.New("API-key revocation was started but its tenant configuration is unavailable")
+			}
 			log.Info("Skipping subscription API-key cleanup because the tenant configuration no longer exists",
 				"subscription", subscription.Namespace+"/"+subscription.Name)
 			if r.Recorder != nil {
@@ -1232,7 +1252,7 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 	if err != nil {
 		return false, fmt.Errorf("resolve owning AITenant for MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
 	}
-	if retain {
+	if !revocationStarted && retain {
 		retentionAllowed, complete, err := r.ensureSubscriptionAPIKeyRevocationJobStoppedBeforeRetention(ctx, subscription)
 		if err != nil {
 			return false, err
@@ -1271,10 +1291,16 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 		if !apierrors.IsNotFound(err) {
 			return false, fmt.Errorf("get subscription API-key cleanup Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
+		if err := r.markSubscriptionAPIKeyRevocationStarted(ctx, subscription); err != nil {
+			return false, fmt.Errorf("mark API-key revocation started on MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
+		}
 		if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 			return false, fmt.Errorf("create subscription API-key cleanup Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
 		return false, nil
+	}
+	if err := r.markSubscriptionAPIKeyRevocationStarted(ctx, subscription); err != nil {
+		return false, fmt.Errorf("mark API-key revocation started on MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
 	}
 
 	if !apiKeyRevocationJobMatchesUID(&existing, string(subscription.UID)) {
@@ -1294,6 +1320,84 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 	}
 	log.Info("Waiting for subscription API-key cleanup Job", "job", existing.Namespace+"/"+existing.Name)
 	return false, nil
+}
+
+func subscriptionAPIKeyRevocationStarted(subscription *maasv1alpha1.MaaSSubscription) bool {
+	condition := apimeta.FindStatusCondition(subscription.Status.Conditions, apiKeysRevocationStartedCondition)
+	return condition != nil &&
+		condition.Status == metav1.ConditionTrue &&
+		condition.Reason == apiKeysRevocationStartedReason
+}
+
+func (r *MaaSSubscriptionReconciler) markSubscriptionAPIKeyRevocationStarted(
+	ctx context.Context,
+	subscription *maasv1alpha1.MaaSSubscription,
+) error {
+	return retry.OnError(retry.DefaultBackoff, apierrors.IsConflict, func() error {
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		live := &maasv1alpha1.MaaSSubscription{}
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(subscription), live); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if subscriptionAPIKeyRevocationStarted(live) {
+			subscription.Status = *live.Status.DeepCopy()
+			subscription.ResourceVersion = live.ResourceVersion
+			return nil
+		}
+
+		base := live.DeepCopy()
+		apimeta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
+			Type:               apiKeysRevocationStartedCondition,
+			Status:             metav1.ConditionTrue,
+			Reason:             apiKeysRevocationStartedReason,
+			Message:            "API-key revocation Job is in progress",
+			ObservedGeneration: live.Generation,
+			LastTransitionTime: metav1.Now(),
+		})
+		patch := client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
+		if err := r.Status().Patch(ctx, live, patch); err != nil {
+			return err
+		}
+		subscription.Status = *live.Status.DeepCopy()
+		subscription.ResourceVersion = live.ResourceVersion
+		return nil
+	})
+}
+
+func (r *MaaSSubscriptionReconciler) subscriptionAPIKeyRevocationJobProgress(
+	ctx context.Context,
+	subscription *maasv1alpha1.MaaSSubscription,
+) (bool, bool, error) {
+	job := &batcv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      subscriptionAPIKeyRevocationJobName(subscription),
+			Namespace: r.AppNamespace,
+		},
+	}
+	jobReader := r.APIReader
+	if jobReader == nil {
+		jobReader = r.Client
+	}
+	var existing batcv1.Job
+	if err := jobReader.Get(ctx, client.ObjectKeyFromObject(job), &existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("get subscription API-key cleanup Job %s/%s: %w", job.Namespace, job.Name, err)
+	}
+	if !apiKeyRevocationJobMatchesUID(&existing, string(subscription.UID)) || jobFailed(&existing) {
+		return false, false, nil
+	}
+	if jobComplete(&existing) {
+		return true, false, nil
+	}
+	return false, true, nil
 }
 
 func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeyRevocationJobStoppedBeforeRetention(
@@ -1321,18 +1425,11 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeyRevocationJobStoppe
 		}
 		return false, false, fmt.Errorf("get subscription API-key cleanup Job %s/%s before retention: %w", job.Namespace, job.Name, err)
 	}
-	if !apiKeyRevocationJobMatchesUID(&existing, string(subscription.UID)) {
-		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-			return false, false, fmt.Errorf("delete stale subscription API-key cleanup Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
-		}
-		return false, false, nil
+	if err := r.markSubscriptionAPIKeyRevocationStarted(ctx, subscription); err != nil {
+		return false, false, fmt.Errorf("mark API-key revocation started on MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
 	}
-	if jobComplete(&existing) {
+	if apiKeyRevocationJobMatchesUID(&existing, string(subscription.UID)) && jobComplete(&existing) {
 		return false, true, nil
-	}
-
-	if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-		return false, false, fmt.Errorf("delete subscription API-key cleanup Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
 	}
 	return false, false, nil
 }
@@ -1351,7 +1448,11 @@ func (r *MaaSSubscriptionReconciler) owningAITenantRequestsRetention(ctx context
 
 	aitenant := &maasv1alpha1.AITenant{}
 	key := types.NamespacedName{Name: aitenantName, Namespace: aitenantNamespace}
-	if err := r.Client.Get(ctx, key, aitenant); err != nil {
+	aitenantReader := r.APIReader
+	if aitenantReader == nil {
+		aitenantReader = r.Client
+	}
+	if err := aitenantReader.Get(ctx, key, aitenant); err != nil {
 		if apierrors.IsNotFound(err) {
 			return tenantConfigRecordsAPIKeysRetention(config), nil
 		}

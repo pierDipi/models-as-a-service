@@ -2,6 +2,7 @@ package maas
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -206,7 +207,7 @@ func TestAITenantDeletion_RetainsTenantAndSubscriptionKeysThroughFinalizers(t *t
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
-func TestEnsureTenantAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing.T) {
+func TestEnsureTenantAPIKeysRevoked_RetentionWaitsForInFlightJob(t *testing.T) {
 	g := NewWithT(t)
 	s := aitenantTestScheme(t)
 	ctx := context.Background()
@@ -248,11 +249,12 @@ func TestEnsureTenantAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing.T) {
 	revoked, err := r.ensureTenantAPIKeysRevoked(ctx, aitenant)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(revoked).To(BeFalse())
-	g.Expect(apierrors.IsNotFound(cl.Get(ctx, client.ObjectKeyFromObject(job), &batcv1.Job{}))).To(BeTrue())
+	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(job), &batcv1.Job{})).To(Succeed())
 
 	var updated maasv1alpha1.AITenant
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(aitenant), &updated)).To(Succeed())
 	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, aitenantAPIKeysRevokedCondition)).To(BeNil())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, apiKeysRevocationStartedCondition)).NotTo(BeNil())
 
 	var updatedTenantConfig maasv1alpha1.MaasTenantConfig
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updatedTenantConfig)).To(Succeed())
@@ -260,11 +262,20 @@ func TestEnsureTenantAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing.T) {
 
 	revoked, err = r.ensureTenantAPIKeysRevoked(ctx, aitenant)
 	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(revoked).To(BeFalse())
+
+	var currentJob batcv1.Job
+	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(job), &currentJob)).To(Succeed())
+	currentJob.Status.Conditions = []batcv1.JobCondition{{Type: batcv1.JobComplete, Status: corev1.ConditionTrue}}
+	g.Expect(cl.Status().Update(ctx, &currentJob)).To(Succeed())
+
+	revoked, err = r.ensureTenantAPIKeysRevoked(ctx, aitenant)
+	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(revoked).To(BeTrue())
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(aitenant), &updated)).To(Succeed())
 	condition := apimeta.FindStatusCondition(updated.Status.Conditions, aitenantAPIKeysRevokedCondition)
 	g.Expect(condition).NotTo(BeNil())
-	g.Expect(condition.Reason).To(Equal(aitenantAPIKeysRevokedReasonRetained))
+	g.Expect(condition.Reason).To(Equal(aitenantAPIKeysRevokedReasonJobCompleted))
 }
 
 func TestEnsureTenantAPIKeysRevoked_RetentionPreservesCompletedJobResult(t *testing.T) {
@@ -317,6 +328,54 @@ func TestEnsureTenantAPIKeysRevoked_RetentionPreservesCompletedJobResult(t *test
 	condition := apimeta.FindStatusCondition(updated.Status.Conditions, aitenantAPIKeysRevokedCondition)
 	g.Expect(condition).NotTo(BeNil())
 	g.Expect(condition.Reason).To(Equal(aitenantAPIKeysRevokedReasonJobCompleted))
+
+	var updatedTenantConfig maasv1alpha1.MaasTenantConfig
+	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updatedTenantConfig)).To(Succeed())
+	g.Expect(apimeta.FindStatusCondition(updatedTenantConfig.Status.Conditions, maasTenantConfigAPIKeysRetainedCondition)).To(BeNil())
+}
+
+func TestEnsureTenantAPIKeysRevoked_RetentionDoesNotResumeAfterJobDisappears(t *testing.T) {
+	g := NewWithT(t)
+	s := aitenantTestScheme(t)
+	ctx := context.Background()
+	appNS := "odh-ai-gateway-infra"
+
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "team-retain",
+			Namespace: tenantreconcile.DefaultAITenantNamespace,
+			UID:       types.UID("retain-uid"),
+			Annotations: map[string]string{
+				retainAPIKeysOnDeleteAnnotation: "true",
+			},
+		},
+	}
+	tenantConfig := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: "ai-tenant-" + aitenant.Name,
+			Annotations: map[string]string{
+				aitenantNameAnnotation:      aitenant.Name,
+				aitenantNamespaceAnnotation: aitenant.Namespace,
+			},
+		},
+	}
+	job := tenantAPIKeyRevocationJob(aitenant, appNS)
+	cl := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(&maasv1alpha1.AITenant{}, &maasv1alpha1.MaasTenantConfig{}, &batcv1.Job{}).
+		WithObjects(aitenant, tenantConfig, job).
+		Build()
+	r := &AITenantReconciler{Client: cl, Scheme: s, APIReader: cl, AppNamespace: appNS}
+
+	revoked, err := r.ensureTenantAPIKeysRevoked(ctx, aitenant)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(revoked).To(BeFalse())
+	g.Expect(cl.Delete(ctx, job)).To(Succeed())
+
+	_, err = r.ensureTenantAPIKeysRevoked(ctx, aitenant)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("operands are unavailable"))
 
 	var updatedTenantConfig maasv1alpha1.MaasTenantConfig
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updatedTenantConfig)).To(Succeed())
@@ -380,6 +439,166 @@ func TestClearTenantConfigAPIKeysRetained(t *testing.T) {
 	var updated maasv1alpha1.MaasTenantConfig
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updated)).To(Succeed())
 	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, maasTenantConfigAPIKeysRetainedCondition)).To(BeNil())
+}
+
+func TestMarkTenantConfigAPIKeysRetained_RetriesConflictAndPreservesConditions(t *testing.T) {
+	g := NewWithT(t)
+	s := aitenantTestScheme(t)
+	ctx := context.Background()
+
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "team-retain",
+			Namespace: tenantreconcile.DefaultAITenantNamespace,
+			UID:       types.UID("retain-uid"),
+		},
+	}
+	tenantConfig := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: "ai-tenant-team-retain",
+			Annotations: map[string]string{
+				aitenantNameAnnotation:      aitenant.Name,
+				aitenantNamespaceAnnotation: aitenant.Namespace,
+			},
+		},
+	}
+	patchCount := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(&maasv1alpha1.MaasTenantConfig{}).
+		WithObjects(tenantConfig).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				config, ok := obj.(*maasv1alpha1.MaasTenantConfig)
+				if !ok {
+					return c.Status().Patch(ctx, obj, patch)
+				}
+				patchCount++
+				if patchCount > 1 {
+					return c.Status().Patch(ctx, obj, patch)
+				}
+				concurrent := &maasv1alpha1.MaasTenantConfig{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(config), concurrent); err != nil {
+					return err
+				}
+				apimeta.SetStatusCondition(&concurrent.Status.Conditions, metav1.Condition{
+					Type:               "Unrelated",
+					Status:             metav1.ConditionTrue,
+					Reason:             "ConcurrentWriter",
+					Message:            "concurrent condition",
+					ObservedGeneration: concurrent.Generation,
+					LastTransitionTime: metav1.Now(),
+				})
+				if err := c.Status().Update(ctx, concurrent); err != nil {
+					return err
+				}
+				return apierrors.NewConflict(
+					schema.GroupResource{Group: maasv1alpha1.GroupVersion.Group, Resource: "maastenantconfigs"},
+					config.Name,
+					errors.New("concurrent update"),
+				)
+			},
+		}).
+		Build()
+	r := &AITenantReconciler{Client: cl, Scheme: s, APIReader: cl}
+
+	g.Expect(r.markTenantConfigAPIKeysRetained(ctx, aitenant)).To(Succeed())
+	g.Expect(patchCount).To(Equal(2))
+
+	var updated maasv1alpha1.MaasTenantConfig
+	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updated)).To(Succeed())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, "Unrelated")).NotTo(BeNil())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, maasTenantConfigAPIKeysRetainedCondition)).NotTo(BeNil())
+}
+
+func TestClearTenantConfigAPIKeysRetained_RetriesConflictAndPreservesConditions(t *testing.T) {
+	g := NewWithT(t)
+	s := aitenantTestScheme(t)
+	ctx := context.Background()
+
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "team-recreated",
+			Namespace: tenantreconcile.DefaultAITenantNamespace,
+			UID:       types.UID("recreated-uid"),
+		},
+	}
+	tenantConfig := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: "ai-tenant-team-recreated",
+			Annotations: map[string]string{
+				aitenantNameAnnotation:      aitenant.Name,
+				aitenantNamespaceAnnotation: aitenant.Namespace,
+			},
+		},
+		Status: maasv1alpha1.MaasTenantConfigStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               maasTenantConfigAPIKeysRetainedCondition,
+					Status:             metav1.ConditionTrue,
+					Reason:             maasTenantConfigAPIKeysRetainedReason,
+					Message:            "old-uid/2026-11-06T12:00:00Z",
+					LastTransitionTime: metav1.Now(),
+				},
+				{
+					Type:               "Unrelated",
+					Status:             metav1.ConditionTrue,
+					Reason:             "ConcurrentWriter",
+					Message:            "concurrent condition",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+	patchCount := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(s).
+		WithStatusSubresource(&maasv1alpha1.MaasTenantConfig{}).
+		WithObjects(tenantConfig).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				config, ok := obj.(*maasv1alpha1.MaasTenantConfig)
+				if !ok {
+					return c.Status().Patch(ctx, obj, patch)
+				}
+				patchCount++
+				if patchCount > 1 {
+					return c.Status().Patch(ctx, obj, patch)
+				}
+				concurrent := &maasv1alpha1.MaasTenantConfig{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(config), concurrent); err != nil {
+					return err
+				}
+				apimeta.SetStatusCondition(&concurrent.Status.Conditions, metav1.Condition{
+					Type:               "AnotherUnrelated",
+					Status:             metav1.ConditionTrue,
+					Reason:             "ConcurrentWriter",
+					Message:            "another concurrent condition",
+					LastTransitionTime: metav1.Now(),
+				})
+				if err := c.Status().Update(ctx, concurrent); err != nil {
+					return err
+				}
+				return apierrors.NewConflict(
+					schema.GroupResource{Group: maasv1alpha1.GroupVersion.Group, Resource: "maastenantconfigs"},
+					config.Name,
+					errors.New("concurrent update"),
+				)
+			},
+		}).
+		Build()
+	r := &AITenantReconciler{Client: cl, Scheme: s, APIReader: cl}
+
+	g.Expect(r.clearTenantConfigAPIKeysRetained(ctx, aitenant)).To(Succeed())
+	g.Expect(patchCount).To(Equal(2))
+
+	var updated maasv1alpha1.MaasTenantConfig
+	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updated)).To(Succeed())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, maasTenantConfigAPIKeysRetainedCondition)).To(BeNil())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, "Unrelated")).NotTo(BeNil())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, "AnotherUnrelated")).NotTo(BeNil())
 }
 
 func TestRequestRevocationOperandsViaMaasTenantConfig_IdempotentPerDeletion(t *testing.T) {

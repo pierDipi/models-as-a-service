@@ -1388,7 +1388,7 @@ func (r *AITenantReconciler) ensureTenantAPIKeysRevoked(ctx context.Context, ait
 	if tenantAPIKeysRevoked(aitenant) {
 		return true, nil
 	}
-	if aitenant.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
+	if !tenantAPIKeyRevocationStarted(aitenant) && aitenant.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
 		retentionAllowed, revoked, err := r.ensureAPIKeyRevocationJobStoppedBeforeRetention(ctx, aitenant)
 		if err != nil {
 			return false, err
@@ -1411,15 +1411,26 @@ func (r *AITenantReconciler) ensureTenantAPIKeysRevoked(ctx context.Context, ait
 		if !isNotFoundError(err) {
 			return false, fmt.Errorf("get API key revocation Job %s/%s: %w", job.Namespace, job.Name, err)
 		}
-		operandsReady, err := r.prepareRevocationOperands(ctx, aitenant)
-		if err != nil {
-			return false, err
-		}
-		if tenantAPIKeysRevoked(aitenant) {
-			return true, nil
+		var operandsReady bool
+		if tenantAPIKeyRevocationStarted(aitenant) {
+			operandsReady = r.revocationOperandsReady(ctx, aitenant)
+			if !operandsReady {
+				return false, errors.New("API-key revocation was started but its operands are unavailable")
+			}
+		} else {
+			operandsReady, err = r.prepareRevocationOperands(ctx, aitenant)
+			if err != nil {
+				return false, err
+			}
+			if tenantAPIKeysRevoked(aitenant) {
+				return true, nil
+			}
 		}
 		if !operandsReady {
 			return false, nil
+		}
+		if err := r.markAITenantAPIKeyRevocationStarted(ctx, aitenant); err != nil {
+			return false, fmt.Errorf("mark API-key revocation started on AITenant %s/%s: %w", aitenant.Namespace, aitenant.Name, err)
 		}
 		if err := r.Create(ctx, job); err != nil {
 			if !isAlreadyExistsError(err) {
@@ -1427,6 +1438,9 @@ func (r *AITenantReconciler) ensureTenantAPIKeysRevoked(ctx context.Context, ait
 			}
 		}
 		return false, nil
+	}
+	if err := r.markAITenantAPIKeyRevocationStarted(ctx, aitenant); err != nil {
+		return false, fmt.Errorf("mark API-key revocation started on AITenant %s/%s: %w", aitenant.Namespace, aitenant.Name, err)
 	}
 	if !tenantAPIKeyRevocationJobMatchesAITenant(&existing, aitenant) {
 		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
@@ -1466,21 +1480,14 @@ func (r *AITenantReconciler) ensureAPIKeyRevocationJobStoppedBeforeRetention(
 		}
 		return false, false, fmt.Errorf("get API key revocation Job %s/%s before retention: %w", job.Namespace, job.Name, err)
 	}
-	if !tenantAPIKeyRevocationJobMatchesAITenant(&existing, aitenant) {
-		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-			return false, false, fmt.Errorf("delete stale API key revocation Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
-		}
-		return false, false, nil
+	if err := r.markAITenantAPIKeyRevocationStarted(ctx, aitenant); err != nil {
+		return false, false, fmt.Errorf("mark API-key revocation started on AITenant %s/%s: %w", aitenant.Namespace, aitenant.Name, err)
 	}
-	if jobComplete(&existing) {
+	if tenantAPIKeyRevocationJobMatchesAITenant(&existing, aitenant) && jobComplete(&existing) {
 		if err := r.markTenantAPIKeysRevoked(ctx, aitenant); err != nil {
 			return false, false, err
 		}
 		return false, true, nil
-	}
-
-	if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-		return false, false, fmt.Errorf("delete API key revocation Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
 	}
 	return false, false, nil
 }

@@ -53,6 +53,18 @@ func (c clientRejectingJobGets) Get(ctx context.Context, key client.ObjectKey, o
 	return c.Client.Get(ctx, key, obj, opts...)
 }
 
+type clientRejectingTenantReads struct {
+	client.Client
+}
+
+func (c clientRejectingTenantReads) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	switch obj.(type) {
+	case *maasv1alpha1.MaasTenantConfig, *maasv1alpha1.AITenant:
+		return errors.New("tenant ownership read must use APIReader")
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
 // subscriptionModelRefIndexer is the field indexer function for MaaSSubscription.
 // Extracted as a helper to be reused across tests with fake clients.
 func subscriptionModelRefIndexer(obj client.Object) []string {
@@ -193,7 +205,12 @@ func TestEnsureSubscriptionAPIKeysRevoked_CreatesScopedJob(t *testing.T) {
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&batcv1.Job{}).WithObjects(subscription, tenant).Build()
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&batcv1.Job{}).
+		WithStatusSubresource(&maasv1alpha1.MaaSSubscription{}).
+		WithObjects(subscription, tenant).
+		Build()
 	r := &MaaSSubscriptionReconciler{
 		Client:       clientRejectingJobGets{Client: c},
 		APIReader:    c,
@@ -413,6 +430,72 @@ func TestEnsureSubscriptionAPIKeysRevoked_SkipsWhenOwningAITenantRequestsRetenti
 	}
 }
 
+func TestEnsureSubscriptionAPIKeysRevoked_UsesAPIReaderForTenantOwnership(t *testing.T) {
+	const (
+		tenantNamespace   = "team-a-maas"
+		aitenantNamespace = "odh-ai-tenants"
+		aitenantName      = "team-a"
+		appNamespace      = "odh-ai-gateway-infra"
+	)
+
+	subscription := newMaaSSubscription("sub-delete", tenantNamespace, "team-a", "llm", 100)
+	tenant := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: tenantNamespace,
+			Labels: map[string]string{
+				"maas.opendatahub.io/managed-by-aitenant": "true",
+				"maas.opendatahub.io/tenant-name":         aitenantName,
+				"maas.opendatahub.io/tenant-namespace":    tenantNamespace,
+			},
+			Annotations: map[string]string{
+				aitenantNameAnnotation:      aitenantName,
+				aitenantNamespaceAnnotation: aitenantNamespace,
+			},
+		},
+	}
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      aitenantName,
+			Namespace: aitenantNamespace,
+			Annotations: map[string]string{
+				retainAPIKeysOnDeleteAnnotation: "true",
+			},
+		},
+	}
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(tenant, aitenant).
+		Build()
+	cachedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&batcv1.Job{}).
+		WithObjects(subscription).
+		Build()
+	r := &MaaSSubscriptionReconciler{
+		Client:       clientRejectingTenantReads{Client: cachedClient},
+		APIReader:    apiReader,
+		Scheme:       scheme,
+		AppNamespace: appNamespace,
+	}
+
+	complete, err := r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+	if err != nil {
+		t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
+	}
+	if !complete {
+		t.Fatal("cleanup must be retained when the live owning AITenant requests retention")
+	}
+
+	jobs := &batcv1.JobList{}
+	if err := cachedClient.List(context.Background(), jobs); err != nil {
+		t.Fatalf("list cleanup Jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("cleanup Jobs = %d, want 0", len(jobs.Items))
+	}
+}
+
 func TestEnsureSubscriptionAPIKeysRevoked_SkipsWhenAITenantIsGoneAfterRetention(t *testing.T) {
 	const tenantNamespace = "team-a-maas"
 
@@ -476,7 +559,7 @@ func TestEnsureSubscriptionAPIKeysRevoked_SkipsWhenAITenantIsGoneAfterRetention(
 	}
 }
 
-func TestEnsureSubscriptionAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing.T) {
+func TestEnsureSubscriptionAPIKeysRevoked_RetentionWaitsForInFlightJob(t *testing.T) {
 	tests := []struct {
 		name      string
 		inherited bool
@@ -527,7 +610,7 @@ func TestEnsureSubscriptionAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing
 			}
 			c := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithStatusSubresource(&batcv1.Job{}).
+				WithStatusSubresource(&batcv1.Job{}, &maasv1alpha1.MaaSSubscription{}).
 				WithObjects(objects...).
 				Build()
 			recorder := events.NewFakeRecorder(1)
@@ -544,26 +627,44 @@ func TestEnsureSubscriptionAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing
 				t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
 			}
 			if complete {
-				t.Fatal("cleanup must wait while an in-flight subscription Job is deleted")
+				t.Fatal("cleanup must wait while an in-flight subscription Job runs")
 			}
-			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batcv1.Job{}); !apierrors.IsNotFound(err) {
-				t.Fatalf("get in-flight cleanup Job after retention: %v, want NotFound", err)
+			var currentJob batcv1.Job
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &currentJob); err != nil {
+				t.Fatalf("get in-flight cleanup Job: %v", err)
+			}
+
+			var updated maasv1alpha1.MaaSSubscription
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(subscription), &updated); err != nil {
+				t.Fatalf("get updated subscription: %v", err)
+			}
+			if apimeta.FindStatusCondition(updated.Status.Conditions, apiKeysRevocationStartedCondition) == nil {
+				t.Fatal("expected APIKeysRevocationStarted condition")
 			}
 
 			complete, err = r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
 			if err != nil {
-				t.Fatalf("ensureSubscriptionAPIKeysRevoked after Job deletion: %v", err)
+				t.Fatalf("ensureSubscriptionAPIKeysRevoked while Job is active: %v", err)
+			}
+			if complete {
+				t.Fatal("cleanup must wait for the in-flight Job to complete")
+			}
+			currentJob.Status.Conditions = []batcv1.JobCondition{{Type: batcv1.JobComplete, Status: corev1.ConditionTrue}}
+			if err := c.Status().Update(context.Background(), &currentJob); err != nil {
+				t.Fatalf("mark cleanup Job complete: %v", err)
+			}
+
+			complete, err = r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+			if err != nil {
+				t.Fatalf("ensureSubscriptionAPIKeysRevoked after Job completion: %v", err)
 			}
 			if !complete {
-				t.Fatal("cleanup must complete after the in-flight Job is gone")
+				t.Fatal("cleanup must complete after the Job completes")
 			}
 			select {
 			case event := <-recorder.Events:
-				if !strings.Contains(event, "Normal APIKeyCleanupSkipped") {
-					t.Fatalf("event = %q, want Normal APIKeyCleanupSkipped", event)
-				}
+				t.Fatalf("event = %q, want none after cleanup Job completes", event)
 			default:
-				t.Fatal("expected a Normal event after the in-flight Job is gone")
 			}
 		})
 	}
@@ -581,7 +682,7 @@ func TestEnsureSubscriptionAPIKeysRevoked_RetentionPreservesCompletedJobResult(t
 	job.Status.Conditions = []batcv1.JobCondition{{Type: batcv1.JobComplete, Status: corev1.ConditionTrue}}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&batcv1.Job{}).
+		WithStatusSubresource(&batcv1.Job{}, &maasv1alpha1.MaaSSubscription{}).
 		WithObjects(subscription, job).
 		Build()
 	recorder := events.NewFakeRecorder(1)
@@ -606,6 +707,70 @@ func TestEnsureSubscriptionAPIKeysRevoked_RetentionPreservesCompletedJobResult(t
 	select {
 	case event := <-recorder.Events:
 		t.Fatalf("event = %q, want none for a completed cleanup Job", event)
+	default:
+	}
+}
+
+func TestEnsureSubscriptionAPIKeysRevoked_RetentionDoesNotResumeAfterJobDisappears(t *testing.T) {
+	const (
+		tenantNamespace = "team-a-maas"
+		appNamespace    = "odh-ai-gateway-infra"
+	)
+
+	subscription := newMaaSSubscription("sub-delete", tenantNamespace, "team-a", "llm", 100)
+	subscription.UID = types.UID("subscription-uid")
+	subscription.Annotations = map[string]string{
+		retainAPIKeysOnDeleteAnnotation: "true",
+	}
+	tenant := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: tenantNamespace,
+			Labels: map[string]string{
+				"maas.opendatahub.io/tenant-name":      "team-a",
+				"maas.opendatahub.io/tenant-namespace": tenantNamespace,
+			},
+		},
+	}
+	job := subscriptionAPIKeyRevocationJob(subscription, "team-a", "team-a", appNamespace)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&batcv1.Job{}, &maasv1alpha1.MaaSSubscription{}).
+		WithObjects(subscription, tenant, job).
+		Build()
+	recorder := events.NewFakeRecorder(1)
+	r := &MaaSSubscriptionReconciler{
+		Client:       c,
+		APIReader:    c,
+		Scheme:       scheme,
+		AppNamespace: appNamespace,
+		Recorder:     recorder,
+	}
+
+	complete, err := r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+	if err != nil {
+		t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
+	}
+	if complete {
+		t.Fatal("cleanup must wait while an in-flight subscription Job runs")
+	}
+	if err := c.Delete(context.Background(), job); err != nil {
+		t.Fatalf("delete in-flight cleanup Job: %v", err)
+	}
+
+	complete, err = r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+	if err != nil {
+		t.Fatalf("ensureSubscriptionAPIKeysRevoked after Job disappearance: %v", err)
+	}
+	if complete {
+		t.Fatal("cleanup must replace a disappeared revocation Job instead of retaining API keys")
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batcv1.Job{}); err != nil {
+		t.Fatalf("get replacement cleanup Job: %v", err)
+	}
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("event = %q, want none after revocation started", event)
 	default:
 	}
 }
@@ -1014,6 +1179,7 @@ func TestMaaSSubscriptionReconciler_DeleteAnnotation(t *testing.T) {
 				WithScheme(scheme).
 				WithRESTMapper(testRESTMapper()).
 				WithStatusSubresource(&batcv1.Job{}).
+				WithStatusSubresource(&maasv1alpha1.MaaSSubscription{}).
 				WithObjects(maasSub, tenant, existingTRLP, cleanupJob).
 				WithIndex(&maasv1alpha1.MaaSSubscription{}, "spec.modelRef", subscriptionModelRefIndexer).
 				Build()
