@@ -31,8 +31,8 @@ const (
 	maasTenantConfigRevocationOperandsRequestedAnnotation = "maas.opendatahub.io/revocation-operands-requested"
 	maasTenantConfigAPIKeysRetainedCondition              = "APIKeysRetained"
 	maasTenantConfigAPIKeysRetainedReason                 = "ExternalOwner"
-	apiKeysRevocationStartedCondition                     = "APIKeysRevocationStarted"
-	apiKeysRevocationStartedReason                        = "RevocationJobInProgress"
+	maasAPIKeysRevocationStartedCondition                 = "APIKeysRevocationStarted"
+	maasAPIKeysRevocationStartedReason                    = "RevocationJobInProgress"
 )
 
 func (r *AITenantReconciler) retainTenantAPIKeys(ctx context.Context, aitenant *maasv1alpha1.AITenant) (bool, error) {
@@ -65,10 +65,10 @@ func (r *AITenantReconciler) retainTenantAPIKeys(ctx context.Context, aitenant *
 }
 
 func tenantAPIKeyRevocationStarted(aitenant *maasv1alpha1.AITenant) bool {
-	condition := apimeta.FindStatusCondition(aitenant.Status.Conditions, apiKeysRevocationStartedCondition)
+	condition := apimeta.FindStatusCondition(aitenant.Status.Conditions, maasAPIKeysRevocationStartedCondition)
 	return condition != nil &&
 		condition.Status == metav1.ConditionTrue &&
-		condition.Reason == apiKeysRevocationStartedReason
+		condition.Reason == maasAPIKeysRevocationStartedReason
 }
 
 func (r *AITenantReconciler) markAITenantAPIKeyRevocationStarted(ctx context.Context, aitenant *maasv1alpha1.AITenant) error {
@@ -85,9 +85,9 @@ func (r *AITenantReconciler) markAITenantAPIKeyRevocationStarted(ctx context.Con
 
 		base := live.DeepCopy()
 		apimeta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
-			Type:               apiKeysRevocationStartedCondition,
+			Type:               maasAPIKeysRevocationStartedCondition,
 			Status:             metav1.ConditionTrue,
-			Reason:             apiKeysRevocationStartedReason,
+			Reason:             maasAPIKeysRevocationStartedReason,
 			Message:            "API-key revocation Job is in progress",
 			ObservedGeneration: live.Generation,
 			LastTransitionTime: metav1.Now(),

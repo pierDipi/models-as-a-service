@@ -254,7 +254,7 @@ func TestEnsureTenantAPIKeysRevoked_RetentionWaitsForInFlightJob(t *testing.T) {
 	var updated maasv1alpha1.AITenant
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(aitenant), &updated)).To(Succeed())
 	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, aitenantAPIKeysRevokedCondition)).To(BeNil())
-	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, apiKeysRevocationStartedCondition)).NotTo(BeNil())
+	g.Expect(apimeta.FindStatusCondition(updated.Status.Conditions, maasAPIKeysRevocationStartedCondition)).NotTo(BeNil())
 
 	var updatedTenantConfig maasv1alpha1.MaasTenantConfig
 	g.Expect(cl.Get(ctx, client.ObjectKeyFromObject(tenantConfig), &updatedTenantConfig)).To(Succeed())

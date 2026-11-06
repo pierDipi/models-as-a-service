@@ -638,7 +638,7 @@ func TestEnsureSubscriptionAPIKeysRevoked_RetentionWaitsForInFlightJob(t *testin
 			if err := c.Get(context.Background(), client.ObjectKeyFromObject(subscription), &updated); err != nil {
 				t.Fatalf("get updated subscription: %v", err)
 			}
-			if apimeta.FindStatusCondition(updated.Status.Conditions, apiKeysRevocationStartedCondition) == nil {
+			if apimeta.FindStatusCondition(updated.Status.Conditions, maasAPIKeysRevocationStartedCondition) == nil {
 				t.Fatal("expected APIKeysRevocationStarted condition")
 			}
 

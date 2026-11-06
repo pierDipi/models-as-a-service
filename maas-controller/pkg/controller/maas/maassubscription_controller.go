@@ -1323,10 +1323,10 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 }
 
 func subscriptionAPIKeyRevocationStarted(subscription *maasv1alpha1.MaaSSubscription) bool {
-	condition := apimeta.FindStatusCondition(subscription.Status.Conditions, apiKeysRevocationStartedCondition)
+	condition := apimeta.FindStatusCondition(subscription.Status.Conditions, maasAPIKeysRevocationStartedCondition)
 	return condition != nil &&
 		condition.Status == metav1.ConditionTrue &&
-		condition.Reason == apiKeysRevocationStartedReason
+		condition.Reason == maasAPIKeysRevocationStartedReason
 }
 
 func (r *MaaSSubscriptionReconciler) markSubscriptionAPIKeyRevocationStarted(
@@ -1353,9 +1353,9 @@ func (r *MaaSSubscriptionReconciler) markSubscriptionAPIKeyRevocationStarted(
 
 		base := live.DeepCopy()
 		apimeta.SetStatusCondition(&live.Status.Conditions, metav1.Condition{
-			Type:               apiKeysRevocationStartedCondition,
+			Type:               maasAPIKeysRevocationStartedCondition,
 			Status:             metav1.ConditionTrue,
-			Reason:             apiKeysRevocationStartedReason,
+			Reason:             maasAPIKeysRevocationStartedReason,
 			Message:            "API-key revocation Job is in progress",
 			ObservedGeneration: live.Generation,
 			LastTransitionTime: metav1.Now(),
