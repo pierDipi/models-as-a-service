@@ -339,6 +339,277 @@ func TestEnsureSubscriptionAPIKeysRevoked_SkipsWhenRetainAnnotationSet(t *testin
 	}
 }
 
+func TestEnsureSubscriptionAPIKeysRevoked_SkipsWhenOwningAITenantRequestsRetention(t *testing.T) {
+	const (
+		tenantNamespace   = "team-a-maas"
+		aitenantNamespace = "odh-ai-tenants"
+		aitenantName      = "team-a"
+		appNamespace      = "odh-ai-gateway-infra"
+	)
+
+	subscription := newMaaSSubscription("sub-delete", tenantNamespace, "team-a", "llm", 100)
+	tenant := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: tenantNamespace,
+			Labels: map[string]string{
+				"maas.opendatahub.io/managed-by-aitenant": "true",
+				"maas.opendatahub.io/tenant-name":         aitenantName,
+				"maas.opendatahub.io/tenant-namespace":    tenantNamespace,
+			},
+			Annotations: map[string]string{
+				aitenantNameAnnotation:      aitenantName,
+				aitenantNamespaceAnnotation: aitenantNamespace,
+			},
+		},
+	}
+	aitenant := &maasv1alpha1.AITenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      aitenantName,
+			Namespace: aitenantNamespace,
+			Annotations: map[string]string{
+				retainAPIKeysOnDeleteAnnotation: "true",
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&batcv1.Job{}).
+		WithObjects(subscription, tenant, aitenant).
+		Build()
+	recorder := events.NewFakeRecorder(1)
+	r := &MaaSSubscriptionReconciler{
+		Client:       c,
+		APIReader:    c,
+		Scheme:       scheme,
+		AppNamespace: appNamespace,
+		Recorder:     recorder,
+	}
+
+	complete, err := r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+	if err != nil {
+		t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
+	}
+	if !complete {
+		t.Fatal("cleanup must be considered complete when the owning AITenant retains API keys")
+	}
+
+	jobs := &batcv1.JobList{}
+	if err := c.List(context.Background(), jobs); err != nil {
+		t.Fatalf("list cleanup Jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("cleanup Jobs = %d, want 0", len(jobs.Items))
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "Normal APIKeyCleanupSkipped") {
+			t.Fatalf("event = %q, want Normal APIKeyCleanupSkipped", event)
+		}
+	default:
+		t.Fatal("expected a Normal event when the owning AITenant retains API keys")
+	}
+}
+
+func TestEnsureSubscriptionAPIKeysRevoked_SkipsWhenAITenantIsGoneAfterRetention(t *testing.T) {
+	const tenantNamespace = "team-a-maas"
+
+	subscription := newMaaSSubscription("sub-delete", tenantNamespace, "team-a", "llm", 100)
+	tenant := &maasv1alpha1.MaasTenantConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+			Namespace: tenantNamespace,
+			Annotations: map[string]string{
+				aitenantNameAnnotation:      "team-a",
+				aitenantNamespaceAnnotation: "odh-ai-tenants",
+			},
+		},
+		Status: maasv1alpha1.MaasTenantConfigStatus{
+			Conditions: []metav1.Condition{{
+				Type:    maasTenantConfigAPIKeysRetainedCondition,
+				Status:  metav1.ConditionTrue,
+				Reason:  maasTenantConfigAPIKeysRetainedReason,
+				Message: "team-a-uid/2026-11-06T12:00:00Z",
+			}},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&batcv1.Job{}).
+		WithObjects(subscription, tenant).
+		Build()
+	recorder := events.NewFakeRecorder(1)
+	r := &MaaSSubscriptionReconciler{
+		Client:       c,
+		APIReader:    c,
+		Scheme:       scheme,
+		AppNamespace: "odh-ai-gateway-infra",
+		Recorder:     recorder,
+	}
+
+	complete, err := r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+	if err != nil {
+		t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
+	}
+	if !complete {
+		t.Fatal("cleanup must be considered complete when recorded AITenant retention outlives the AITenant")
+	}
+
+	jobs := &batcv1.JobList{}
+	if err := c.List(context.Background(), jobs); err != nil {
+		t.Fatalf("list cleanup Jobs: %v", err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("cleanup Jobs = %d, want 0", len(jobs.Items))
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "Normal APIKeyCleanupSkipped") {
+			t.Fatalf("event = %q, want Normal APIKeyCleanupSkipped", event)
+		}
+	default:
+		t.Fatal("expected a Normal event when recorded AITenant retention outlives the AITenant")
+	}
+}
+
+func TestEnsureSubscriptionAPIKeysRevoked_RetentionDeletesInFlightJob(t *testing.T) {
+	tests := []struct {
+		name      string
+		inherited bool
+	}{
+		{name: "subscription annotation"},
+		{name: "owning AITenant annotation", inherited: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const (
+				tenantNamespace   = "team-a-maas"
+				aitenantNamespace = "odh-ai-tenants"
+				appNamespace      = "odh-ai-gateway-infra"
+			)
+
+			subscription := newMaaSSubscription("sub-delete", tenantNamespace, "team-a", "llm", 100)
+			subscription.UID = types.UID("subscription-uid")
+			tenant := &maasv1alpha1.MaasTenantConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      maasv1alpha1.MaasTenantConfigInstanceName,
+					Namespace: tenantNamespace,
+					Annotations: map[string]string{
+						aitenantNameAnnotation:      "team-a",
+						aitenantNamespaceAnnotation: aitenantNamespace,
+					},
+				},
+			}
+			aitenant := &maasv1alpha1.AITenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "team-a",
+					Namespace: aitenantNamespace,
+					Annotations: map[string]string{
+						retainAPIKeysOnDeleteAnnotation: "true",
+					},
+				},
+			}
+			if !tt.inherited {
+				subscription.Annotations = map[string]string{
+					retainAPIKeysOnDeleteAnnotation: "true",
+				}
+			}
+			job := subscriptionAPIKeyRevocationJob(subscription, "team-a", "team-a", appNamespace)
+
+			objects := []client.Object{subscription, job}
+			if tt.inherited {
+				objects = append(objects, tenant, aitenant)
+			}
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithStatusSubresource(&batcv1.Job{}).
+				WithObjects(objects...).
+				Build()
+			recorder := events.NewFakeRecorder(1)
+			r := &MaaSSubscriptionReconciler{
+				Client:       c,
+				APIReader:    c,
+				Scheme:       scheme,
+				AppNamespace: appNamespace,
+				Recorder:     recorder,
+			}
+
+			complete, err := r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+			if err != nil {
+				t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
+			}
+			if complete {
+				t.Fatal("cleanup must wait while an in-flight subscription Job is deleted")
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batcv1.Job{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("get in-flight cleanup Job after retention: %v, want NotFound", err)
+			}
+
+			complete, err = r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+			if err != nil {
+				t.Fatalf("ensureSubscriptionAPIKeysRevoked after Job deletion: %v", err)
+			}
+			if !complete {
+				t.Fatal("cleanup must complete after the in-flight Job is gone")
+			}
+			select {
+			case event := <-recorder.Events:
+				if !strings.Contains(event, "Normal APIKeyCleanupSkipped") {
+					t.Fatalf("event = %q, want Normal APIKeyCleanupSkipped", event)
+				}
+			default:
+				t.Fatal("expected a Normal event after the in-flight Job is gone")
+			}
+		})
+	}
+}
+
+func TestEnsureSubscriptionAPIKeysRevoked_RetentionPreservesCompletedJobResult(t *testing.T) {
+	const appNamespace = "odh-ai-gateway-infra"
+
+	subscription := newMaaSSubscription("sub-delete", "team-a-maas", "team-a", "llm", 100)
+	subscription.UID = types.UID("subscription-uid")
+	subscription.Annotations = map[string]string{
+		retainAPIKeysOnDeleteAnnotation: "true",
+	}
+	job := subscriptionAPIKeyRevocationJob(subscription, "team-a", "team-a", appNamespace)
+	job.Status.Conditions = []batcv1.JobCondition{{Type: batcv1.JobComplete, Status: corev1.ConditionTrue}}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&batcv1.Job{}).
+		WithObjects(subscription, job).
+		Build()
+	recorder := events.NewFakeRecorder(1)
+	r := &MaaSSubscriptionReconciler{
+		Client:       c,
+		APIReader:    c,
+		Scheme:       scheme,
+		AppNamespace: appNamespace,
+		Recorder:     recorder,
+	}
+
+	complete, err := r.ensureSubscriptionAPIKeysRevoked(context.Background(), ctrl.Log, subscription)
+	if err != nil {
+		t.Fatalf("ensureSubscriptionAPIKeysRevoked: %v", err)
+	}
+	if !complete {
+		t.Fatal("a completed cleanup Job must remain authoritative")
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(job), &batcv1.Job{}); err != nil {
+		t.Fatalf("get completed cleanup Job: %v", err)
+	}
+	select {
+	case event := <-recorder.Events:
+		t.Fatalf("event = %q, want none for a completed cleanup Job", event)
+	default:
+	}
+}
+
 // TestMaaSSubscriptionReconciler_DuplicateReconciliation verifies that reconciling
 // multiple subscriptions for the same model does not produce redundant TokenRateLimitPolicy updates.
 //

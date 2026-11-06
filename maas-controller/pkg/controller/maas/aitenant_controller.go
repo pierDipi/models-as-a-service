@@ -883,6 +883,9 @@ func (r *AITenantReconciler) ensureTenantConfig(ctx context.Context, aitenant *m
 		}
 		return false, false, err
 	}
+	if err := r.clearTenantConfigAPIKeysRetained(ctx, aitenant); err != nil {
+		return false, false, err
+	}
 	if err := r.markLegacyTenantDeprecated(ctx, aitenant, tenantNamespace); err != nil {
 		return false, false, err
 	}
@@ -1386,6 +1389,16 @@ func (r *AITenantReconciler) ensureTenantAPIKeysRevoked(ctx context.Context, ait
 		return true, nil
 	}
 	if aitenant.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
+		retentionAllowed, revoked, err := r.ensureAPIKeyRevocationJobStoppedBeforeRetention(ctx, aitenant)
+		if err != nil {
+			return false, err
+		}
+		if revoked {
+			return true, nil
+		}
+		if !retentionAllowed {
+			return false, nil
+		}
 		return r.retainTenantAPIKeys(ctx, aitenant)
 	}
 	if strings.TrimSpace(r.AppNamespace) == "" {
@@ -1435,6 +1448,41 @@ func (r *AITenantReconciler) ensureTenantAPIKeysRevoked(ctx context.Context, ait
 		return false, fmt.Errorf("%w: %s/%s", errTenantAPIKeyRevocationJobFailed, existing.Namespace, existing.Name)
 	}
 	return false, nil
+}
+
+func (r *AITenantReconciler) ensureAPIKeyRevocationJobStoppedBeforeRetention(
+	ctx context.Context,
+	aitenant *maasv1alpha1.AITenant,
+) (bool, bool, error) {
+	if strings.TrimSpace(r.AppNamespace) == "" {
+		return true, false, nil
+	}
+
+	job := tenantAPIKeyRevocationJob(aitenant, r.AppNamespace)
+	var existing batcv1.Job
+	if err := r.get(ctx, client.ObjectKeyFromObject(job), &existing); err != nil {
+		if isNotFoundError(err) {
+			return true, false, nil
+		}
+		return false, false, fmt.Errorf("get API key revocation Job %s/%s before retention: %w", job.Namespace, job.Name, err)
+	}
+	if !tenantAPIKeyRevocationJobMatchesAITenant(&existing, aitenant) {
+		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			return false, false, fmt.Errorf("delete stale API key revocation Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
+		}
+		return false, false, nil
+	}
+	if jobComplete(&existing) {
+		if err := r.markTenantAPIKeysRevoked(ctx, aitenant); err != nil {
+			return false, false, err
+		}
+		return false, true, nil
+	}
+
+	if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+		return false, false, fmt.Errorf("delete API key revocation Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
+	}
+	return false, false, nil
 }
 
 func (r *AITenantReconciler) deleteTenantAPIKeyRevocationJob(ctx context.Context, aitenant *maasv1alpha1.AITenant) error {

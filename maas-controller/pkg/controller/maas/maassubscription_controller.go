@@ -1190,6 +1190,16 @@ func (r *MaaSSubscriptionReconciler) handleDeletion(ctx context.Context, log log
 
 func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription) (bool, error) {
 	if subscription.Annotations[retainAPIKeysOnDeleteAnnotation] == "true" {
+		retentionAllowed, complete, err := r.ensureSubscriptionAPIKeyRevocationJobStoppedBeforeRetention(ctx, subscription)
+		if err != nil {
+			return false, err
+		}
+		if complete {
+			return true, nil
+		}
+		if !retentionAllowed {
+			return false, nil
+		}
 		log.Info("Skipping subscription API-key cleanup because API keys are retained on delete",
 			"subscription", subscription.Namespace+"/"+subscription.Name)
 		if r.Recorder != nil {
@@ -1217,6 +1227,30 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 			return true, nil
 		}
 		return false, fmt.Errorf("resolve tenant for MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
+	}
+	retain, err := r.owningAITenantRequestsRetention(ctx, tenant.config)
+	if err != nil {
+		return false, fmt.Errorf("resolve owning AITenant for MaaSSubscription %s/%s: %w", subscription.Namespace, subscription.Name, err)
+	}
+	if retain {
+		retentionAllowed, complete, err := r.ensureSubscriptionAPIKeyRevocationJobStoppedBeforeRetention(ctx, subscription)
+		if err != nil {
+			return false, err
+		}
+		if complete {
+			return true, nil
+		}
+		if !retentionAllowed {
+			return false, nil
+		}
+		log.Info("Skipping subscription API-key cleanup because the owning AITenant retains API keys on delete",
+			"subscription", subscription.Namespace+"/"+subscription.Name)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(subscription, nil, corev1.EventTypeNormal, "APIKeyCleanupSkipped", "InvalidateAPIKeys",
+				"Skipping API-key cleanup for MaaSSubscription %s/%s because its owning AITenant retains API keys on delete",
+				subscription.Namespace, subscription.Name)
+		}
+		return true, nil
 	}
 	tenantID, err := tenant.identifier()
 	if err != nil {
@@ -1262,11 +1296,82 @@ func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeysRevoked(ctx contex
 	return false, nil
 }
 
+func (r *MaaSSubscriptionReconciler) ensureSubscriptionAPIKeyRevocationJobStoppedBeforeRetention(
+	ctx context.Context,
+	subscription *maasv1alpha1.MaaSSubscription,
+) (bool, bool, error) {
+	if strings.TrimSpace(r.AppNamespace) == "" {
+		return true, false, nil
+	}
+
+	job := &batcv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      subscriptionAPIKeyRevocationJobName(subscription),
+			Namespace: r.AppNamespace,
+		},
+	}
+	jobReader := r.APIReader
+	if jobReader == nil {
+		jobReader = r.Client
+	}
+	var existing batcv1.Job
+	if err := jobReader.Get(ctx, client.ObjectKeyFromObject(job), &existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, false, nil
+		}
+		return false, false, fmt.Errorf("get subscription API-key cleanup Job %s/%s before retention: %w", job.Namespace, job.Name, err)
+	}
+	if !apiKeyRevocationJobMatchesUID(&existing, string(subscription.UID)) {
+		if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			return false, false, fmt.Errorf("delete stale subscription API-key cleanup Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
+		}
+		return false, false, nil
+	}
+	if jobComplete(&existing) {
+		return false, true, nil
+	}
+
+	if err := r.Delete(ctx, &existing, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+		return false, false, fmt.Errorf("delete subscription API-key cleanup Job %s/%s before retention: %w", existing.Namespace, existing.Name, err)
+	}
+	return false, false, nil
+}
+
+func (r *MaaSSubscriptionReconciler) owningAITenantRequestsRetention(ctx context.Context, config *maasv1alpha1.MaasTenantConfig) (bool, error) {
+	if config == nil {
+		return false, nil
+	}
+
+	annotations := config.Annotations
+	aitenantName := annotations[aitenantNameAnnotation]
+	aitenantNamespace := annotations[aitenantNamespaceAnnotation]
+	if aitenantName == "" || aitenantNamespace == "" {
+		return false, nil
+	}
+
+	aitenant := &maasv1alpha1.AITenant{}
+	key := types.NamespacedName{Name: aitenantName, Namespace: aitenantNamespace}
+	if err := r.Client.Get(ctx, key, aitenant); err != nil {
+		if apierrors.IsNotFound(err) {
+			return tenantConfigRecordsAPIKeysRetention(config), nil
+		}
+		return false, fmt.Errorf("get AITenant %s: %w", key.String(), err)
+	}
+	if !ownedByAITenant(config, aitenant) {
+		return false, nil
+	}
+
+	return aitenant.Annotations[retainAPIKeysOnDeleteAnnotation] == "true", nil
+}
+
 func subscriptionAPIKeyRevocationJob(subscription *maasv1alpha1.MaaSSubscription, tenantName, tenantID, namespace string) *batcv1.Job {
-	const maxJobNameForGeneratedPods = 57
-	jobName := aitenantBoundedName("maas-api-revoke-sub-", subscription.Namespace+"-"+subscription.Name, string(subscription.UID), maxJobNameForGeneratedPods)
-	return apiKeyRevocationJob(jobName, subscription.Name, subscription.Namespace, string(subscription.UID),
+	return apiKeyRevocationJob(subscriptionAPIKeyRevocationJobName(subscription), subscription.Name, subscription.Namespace, string(subscription.UID),
 		tenantName, subscription.Name, tenantID, namespace)
+}
+
+func subscriptionAPIKeyRevocationJobName(subscription *maasv1alpha1.MaaSSubscription) string {
+	const maxJobNameForGeneratedPods = 57
+	return aitenantBoundedName("maas-api-revoke-sub-", subscription.Namespace+"-"+subscription.Name, string(subscription.UID), maxJobNameForGeneratedPods)
 }
 
 // updateStatus returns the status write error so Reconcile can hand it to controller-runtime.
